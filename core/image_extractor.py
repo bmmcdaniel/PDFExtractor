@@ -40,6 +40,8 @@ class ImageExtractor:
         Returns:
             Number of unique images extracted.
         """
+        if format not in {"native", "png", "jpeg", "webp"}:
+            raise ValueError(f"Unknown image format: {format!r}")
         doc = self._handler.document
         os.makedirs(output_dir, exist_ok=True)
 
@@ -91,43 +93,46 @@ class ImageExtractor:
     ) -> None:
         """Extract image converted to PNG."""
         pix = pymupdf.Pixmap(doc, xref)
-
-        # Convert CMYK to RGB if needed
-        if pix.n - pix.alpha > 3:
-            pix = pymupdf.Pixmap(pymupdf.csRGB, pix)
-
-        output_path = os.path.join(output_dir, f"img_{xref}.png")
-        pix.save(output_path)
+        try:
+            if pix.n - pix.alpha > 3:
+                if pix.alpha:
+                    pix = pymupdf.Pixmap(pix, 0)
+                pix = pymupdf.Pixmap(pymupdf.csRGB, pix)
+            output_path = os.path.join(output_dir, f"img_{xref}.png")
+            pix.save(output_path)
+        finally:
+            del pix
 
     def _extract_jpeg(
         self, doc: pymupdf.Document, xref: int, output_dir: str
     ) -> None:
         """Extract image converted to JPEG."""
         pix = pymupdf.Pixmap(doc, xref)
-
-        # Convert CMYK to RGB if needed
-        if pix.n - pix.alpha > 3:
-            pix = pymupdf.Pixmap(pymupdf.csRGB, pix)
-
-        # JPEG does not support alpha -- strip it
-        if pix.alpha:
-            pix = pymupdf.Pixmap(pix, 0)
-
-        output_path = os.path.join(output_dir, f"img_{xref}.jpg")
-        pix.save(output_path, output="jpeg", jpg_quality=95)
+        try:
+            if pix.n - pix.alpha > 3:
+                if pix.alpha:
+                    pix = pymupdf.Pixmap(pix, 0)
+                pix = pymupdf.Pixmap(pymupdf.csRGB, pix)
+            if pix.alpha:
+                pix = pymupdf.Pixmap(pix, 0)
+            output_path = os.path.join(output_dir, f"img_{xref}.jpg")
+            pix.save(output_path, output="jpeg", jpg_quality=95)
+        finally:
+            del pix
 
     def _extract_webp(
         self, doc: pymupdf.Document, xref: int, output_dir: str
     ) -> None:
         """Extract image converted to WebP via Pillow."""
         pix = pymupdf.Pixmap(doc, xref)
-
-        # Convert CMYK to RGB if needed
-        if pix.n - pix.alpha > 3:
-            pix = pymupdf.Pixmap(pymupdf.csRGB, pix)
-
-        mode = "RGBA" if pix.alpha else "RGB"
-        img = Image.frombytes(mode, (pix.width, pix.height), pix.samples)
-
-        output_path = os.path.join(output_dir, f"img_{xref}.webp")
-        img.save(output_path, "WEBP", quality=90)
+        try:
+            if pix.n - pix.alpha > 3:
+                if pix.alpha:
+                    pix = pymupdf.Pixmap(pix, 0)
+                pix = pymupdf.Pixmap(pymupdf.csRGB, pix)
+            mode = "RGBA" if pix.alpha else "RGB"
+            img = Image.frombytes(mode, (pix.width, pix.height), pix.samples)
+            output_path = os.path.join(output_dir, f"img_{xref}.webp")
+            img.save(output_path, "WEBP", quality=90)
+        finally:
+            del pix

@@ -12,7 +12,8 @@ _SETTINGS_PATH = Path.home() / ".pdfextractor" / "settings.json"
 def load_settings() -> dict:
     """Load settings from disk. Returns empty dict on missing or corrupt file."""
     try:
-        return json.loads(_SETTINGS_PATH.read_text(encoding="utf-8"))
+        data = json.loads(_SETTINGS_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return {}
 

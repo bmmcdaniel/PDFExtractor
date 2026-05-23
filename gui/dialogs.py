@@ -2,10 +2,63 @@
 
 import logging
 import os
+import subprocess
+import sys
 
 import customtkinter
 
 log = logging.getLogger(__name__)
+
+
+def _open_path(path: str) -> None:
+    if sys.platform == "win32":
+        os.startfile(path)
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", path])
+    else:
+        subprocess.Popen(["xdg-open", path])
+
+
+def ask_hex_handling(parent, message: str) -> bool:
+    """Ask whether to apply book-specific per-page naming. Returns True for Yes.
+
+    *message* is provided by the BookHandler and should be two lines:
+    the first identifying the book, the second asking the question.
+    """
+    result = [False]
+
+    dialog = customtkinter.CTkToplevel(parent)
+    dialog.title("Book Detected")
+    dialog.geometry("440x160")
+    dialog.resizable(False, False)
+    dialog.transient(parent)
+    dialog.grab_set()
+
+    dialog.update_idletasks()
+    x = parent.winfo_x() + (parent.winfo_width() - 440) // 2
+    y = parent.winfo_y() + (parent.winfo_height() - 160) // 2
+    dialog.geometry(f"+{x}+{y}")
+
+    customtkinter.CTkLabel(
+        dialog,
+        text=message,
+        wraplength=400,
+        justify="center",
+    ).pack(padx=20, pady=(25, 10), fill="both", expand=True)
+
+    btn_frame = customtkinter.CTkFrame(dialog, fg_color="transparent")
+    btn_frame.pack(pady=(0, 20))
+
+    def on_yes():
+        result[0] = True
+        dialog.destroy()
+
+    customtkinter.CTkButton(btn_frame, text="Yes", command=on_yes, width=80).pack(side="left", padx=10)
+    customtkinter.CTkButton(btn_frame, text="No", command=dialog.destroy, width=80).pack(side="left", padx=10)
+
+    dialog.after(100, dialog.focus_force)
+    dialog.wait_window()
+    return result[0]
 
 
 def show_error(parent, message: str) -> None:
@@ -63,7 +116,7 @@ def show_completion(
 
     if file_path:
         def open_file():
-            os.startfile(file_path)
+            _open_path(file_path)
             dialog.destroy()
 
         customtkinter.CTkButton(
@@ -72,7 +125,7 @@ def show_completion(
 
     if folder_path:
         def open_folder():
-            os.startfile(folder_path)
+            _open_path(folder_path)
             dialog.destroy()
 
         customtkinter.CTkButton(

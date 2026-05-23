@@ -50,7 +50,7 @@ class ThumbnailGrid(customtkinter.CTkScrollableFrame):
         self._preview_win: tkinter.Toplevel | None = None
         self._preview_after_id: str | None = None
         self._preview_page_index: int | None = None
-        self.bind_all("<Configure>", self._on_configure)
+        self.bind("<Configure>", self._on_configure)
         self.bind_all("<Control-MouseWheel>", self._on_ctrl_scroll)
         self.bind_all("<Control-Double-Button-1>", self._on_ctrl_double_click)
         self.bind("<Leave>", self._on_grid_leave)
@@ -94,20 +94,12 @@ class ThumbnailGrid(customtkinter.CTkScrollableFrame):
             self._first_cell_frame = cell_frame
             self._columns = 1
         elif index == 1 and self._measured_cell_width is None:
-            cell_frame.grid(row=0, column=1,
-                            padx=self.CELL_PAD, pady=self.CELL_PAD, sticky="n")
-            self.update_idletasks()
-
-            x0 = self._first_cell_frame.winfo_x()
-            x1 = cell_frame.winfo_x()
-            self._measured_cell_width = x1 - x0
-
-            if self._measured_cell_width <= 0:
-                req_w = self._first_cell_frame.winfo_reqwidth()
-                self._measured_cell_width = req_w + self.CELL_PAD * 2
-
+            req_w = self._first_cell_frame.winfo_reqwidth()
+            self._measured_cell_width = req_w + self.CELL_PAD * 2
             self._first_cell_frame = None
             self._columns = self._calc_columns()
+            cell_frame.grid(row=0, column=1,
+                            padx=self.CELL_PAD, pady=self.CELL_PAD, sticky="n")
             self._layout_grid()
         else:
             row = index // self._columns
@@ -143,22 +135,9 @@ class ThumbnailGrid(customtkinter.CTkScrollableFrame):
         """Calculate how many columns fit in the available width."""
         if not self._measured_cell_width:
             return 1
-
-        widths = []
-        try:
-            widths.append(self._parent_canvas.winfo_width())
-        except Exception:
-            pass
-        try:
-            widths.append(self._parent_frame.winfo_width())
-        except Exception:
-            pass
-
-        if not widths or max(widths) <= 1:
+        available = self.winfo_width()
+        if available <= 1:
             available = self.master.winfo_width() - 50
-        else:
-            available = min(widths)
-
         return max(1, available // self._measured_cell_width)
 
     @staticmethod
@@ -190,8 +169,6 @@ class ThumbnailGrid(customtkinter.CTkScrollableFrame):
 
     def _on_configure(self, event) -> None:
         """Debounced resize handler to recalculate columns."""
-        if event.widget is not self and event.widget is not self._parent_frame:
-            return
         if not self._cells or not self._measured_cell_width:
             return
         if self._resize_after_id is not None:
@@ -293,7 +270,7 @@ class ThumbnailGrid(customtkinter.CTkScrollableFrame):
 
     def get_selected_pages(self) -> list[int]:
         """Return list of 0-based page indices that are selected."""
-        return [i for i, cell in enumerate(self._cells) if cell["selected"].get()]
+        return [cell["page_index"] for cell in self._cells if cell["selected"].get()]
 
     def get_selection_count(self) -> int:
         """Return number of currently selected pages."""

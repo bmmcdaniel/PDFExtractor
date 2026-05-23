@@ -3,7 +3,7 @@
 import logging
 import os
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from tkinter import filedialog
 
@@ -11,11 +11,12 @@ import customtkinter
 from PIL import Image
 from tkinterdnd2 import TkinterDnD, DND_FILES
 
+from core.book_handlers import get_handler
 from core.image_extractor import ImageExtractor
 from core.pdf_handler import PDFHandler
 from core.settings import load_settings, save_settings
 from core.text_extractor import TextExtractor
-from gui.dialogs import show_completion, show_error
+from gui.dialogs import ask_hex_handling, show_completion, show_error
 from gui.extraction_panel import ImagePanel, TextPanel
 from gui.thumbnail_grid import ThumbnailGrid
 
@@ -39,6 +40,7 @@ class App(customtkinter.CTk, TkinterDnD.DnDWrapper):
         self._zoom_status_after_id: str | None = None
 
         self._build_ui()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build_ui(self) -> None:
         """Create all UI widgets."""
@@ -125,6 +127,14 @@ class App(customtkinter.CTk, TkinterDnD.DnDWrapper):
         self.bind_all("<Control-Shift-A>", lambda e: self._thumb_grid.select_none() if not self._working else None)
         self.bind_all("<Control-i>", lambda e: self._thumb_grid.invert_selection() if not self._working else None)
 
+    # --- Window close ---
+
+    def _on_close(self) -> None:
+        """Release file handle and destroy the window."""
+        if self._pdf_handler:
+            self._pdf_handler.close()
+        self.destroy()
+
     # --- Preview callback ---
 
     def _get_preview_image(self, page_index: int) -> Image.Image | None:
@@ -192,6 +202,9 @@ class App(customtkinter.CTk, TkinterDnD.DnDWrapper):
 
     def _load_pdf(self, filepath: str) -> None:
         """Load a PDF and generate thumbnails."""
+        if self._working:
+            return
+
         # Close previous
         if self._pdf_handler:
             self._pdf_handler.close()
@@ -233,20 +246,28 @@ class App(customtkinter.CTk, TkinterDnD.DnDWrapper):
 
         def generate():
             total = handler.page_count
-            batch = []
-            batch_size = 10
             workers = min(4, os.cpu_count() or 1)
+            pending: dict[int, Image.Image] = {}
+            next_flush = 0
+            batch_size = 10
 
-            # PyMuPDF releases the GIL during get_pixmap(), so multiple
-            # threads can render different pages truly in parallel.
             with ThreadPoolExecutor(max_workers=workers) as pool:
-                thumbs = pool.map(handler.get_thumbnail, range(total))
-                for i, thumb in enumerate(thumbs):
-                    batch.append((i, thumb))
-                    if len(batch) >= batch_size or i == total - 1:
-                        self.after(0, self._add_thumbnail_batch, list(batch))
-                        self.after(0, self._update_progress, i + 1, total)
-                        batch.clear()
+                futures = {pool.submit(handler.get_thumbnail, i): i for i in range(total)}
+                for future in as_completed(futures):
+                    i = futures[future]
+                    pending[i] = future.result()
+                    # Flush consecutive in-order thumbnails so they appear as they complete
+                    batch = []
+                    while next_flush in pending:
+                        batch.append((next_flush, pending.pop(next_flush)))
+                        next_flush += 1
+                        if len(batch) >= batch_size:
+                            self._safe_after(0, self._add_thumbnail_batch, list(batch))
+                            self._safe_after(0, self._update_progress, next_flush, total)
+                            batch.clear()
+                    if batch:
+                        self._safe_after(0, self._add_thumbnail_batch, list(batch))
+                        self._safe_after(0, self._update_progress, next_flush, total)
             return total
 
         self._run_in_thread(
@@ -290,6 +311,7 @@ class App(customtkinter.CTk, TkinterDnD.DnDWrapper):
             return
 
         fmt = self._text_panel.get_format()
+        options = self._text_panel.get_options()
 
         ext_map = {
             "md": ("Markdown files", "*.md", ".md"),
@@ -317,6 +339,13 @@ class App(customtkinter.CTk, TkinterDnD.DnDWrapper):
         self._settings["last_save_dir"] = str(Path(output_path).parent)
         save_settings(self._settings)
 
+        book_handler = None
+        use_hex = False
+        if fmt != "docx":
+            book_handler = get_handler(self._pdf_handler.document)
+        if book_handler:
+            use_hex = ask_hex_handling(self, book_handler.detection_message)
+
         self._set_status(f"Extracting text from {len(pages)} pages...")
         self._show_progress()
         self._set_ui_locked(True)
@@ -329,13 +358,30 @@ class App(customtkinter.CTk, TkinterDnD.DnDWrapper):
             "docx": extractor.extract_docx,
         }[fmt]
 
+        per_page = options["per_page"]
+        if fmt == "md":
+            extra = {"per_page": per_page, "normalize_headers": options["normalize_headers"]}
+        elif fmt == "txt":
+            extra = {"per_page": per_page}
+        elif fmt == "xhtml":
+            extra = {"per_page": per_page, "normalize_headers": options["normalize_headers"],
+                     "include_images": options["include_images"]}
+        else:  # docx
+            extra = {"normalize_headers": options["normalize_headers"]}
+
+        doc = self._pdf_handler.document
+
         def do_extract():
+            if use_hex and per_page and book_handler:
+                extra["filename_map"] = book_handler.build_filename_map(doc, pages)
             extract_fn(
                 pages=pages,
                 output_path=output_path,
-                progress_callback=lambda c, t: self.after(0, self._update_progress, c, t),
+                progress_callback=lambda c, t: self._safe_after(0, self._update_progress, c, t),
+                **extra,
             )
-            return output_path
+            folder = str(Path(output_path).parent)
+            return (None if per_page else output_path, folder)
 
         self._run_in_thread(
             target=do_extract,
@@ -343,16 +389,17 @@ class App(customtkinter.CTk, TkinterDnD.DnDWrapper):
             on_error=self._on_extract_error,
         )
 
-    def _on_text_extracted(self, output_path: str) -> None:
+    def _on_text_extracted(self, result) -> None:
         """Handle successful text extraction."""
+        file_path, folder_path = result
         self._set_status("Text extracted successfully")
         self._hide_progress()
         self._set_ui_locked(False)
         show_completion(
             self,
             "Text extracted successfully.",
-            file_path=output_path,
-            folder_path=str(Path(output_path).parent),
+            file_path=file_path,
+            folder_path=folder_path,
         )
 
     # --- Image extraction ---
@@ -393,7 +440,7 @@ class App(customtkinter.CTk, TkinterDnD.DnDWrapper):
                 pages=pages,
                 output_dir=output_dir,
                 format=fmt,
-                progress_callback=lambda c, t: self.after(0, self._update_progress, c, t),
+                progress_callback=lambda c, t: self._safe_after(0, self._update_progress, c, t),
             )
             return count, output_dir
 
@@ -437,16 +484,23 @@ class App(customtkinter.CTk, TkinterDnD.DnDWrapper):
 
         show_error(self, msg)
 
-    # --- Threading helper ---
+    # --- Threading helpers ---
+
+    def _safe_after(self, ms: int, callback, *args) -> None:
+        """Schedule a callback, silently dropping it if the window is already gone."""
+        try:
+            self.after(ms, callback, *args)
+        except Exception:
+            pass
 
     def _run_in_thread(self, target, on_complete, on_error) -> None:
         """Run target function in a background thread."""
         def wrapper():
             try:
                 result = target()
-                self.after(0, on_complete, result)
+                self._safe_after(0, on_complete, result)
             except Exception as e:
-                self.after(0, on_error, e)
+                self._safe_after(0, on_error, e)
 
         thread = threading.Thread(target=wrapper, daemon=True)
         thread.start()
@@ -476,9 +530,6 @@ class App(customtkinter.CTk, TkinterDnD.DnDWrapper):
         self._working = locked
         state = "disabled" if locked else "normal"
         self._open_btn.configure(state=state)
-        if not locked and self._pdf_handler:
-            self._text_panel.set_enabled(True)
-            self._image_panel.set_enabled(True)
-        else:
-            self._text_panel.set_enabled(not locked and self._pdf_handler is not None)
-            self._image_panel.set_enabled(not locked and self._pdf_handler is not None)
+        enabled = not locked and self._pdf_handler is not None
+        self._text_panel.set_enabled(enabled)
+        self._image_panel.set_enabled(enabled)
