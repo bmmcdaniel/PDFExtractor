@@ -577,24 +577,52 @@ def _split_geo_sections(geo_el: ET.Element) -> ET.Element:
     immediately before each new section label so sections share one paragraph
     block with only a line-break between them (no paragraph spacing).
 
-    Multi-element labels such as "Within the Ring of Chell (<i>p20</i>):"
-    are handled naturally: only the final <b> ends with ':', so the preceding
-    elements accumulate into the same section until the ':' is seen.
+    Some labels span multiple consecutive <b> elements with no intervening text
+    (e.g. "Within the Ring of Chell (<i>p20</i>):"), split as:
+        <b>Within the Ring of Chell (</b><b><i>p20</i></b><b>):</b>
+    These are detected by walking the chain: if consecutive <b> elements have
+    empty tails between them and the chain starts with an alpha character and
+    the final element ends with ':', the break is placed before the first element.
     """
     children = list(geo_el)
 
     # Identify child indices where a new section begins (a label after a prior label).
     section_breaks: set[int] = set()
     label_seen = False
-    for i, child in enumerate(children):
-        child_inner = ''.join(child.itertext()).strip()
-        child_tail = (child.tail or '').strip()
-        is_label = (child.tag == _TAG_B and child_inner.endswith(':')
-                    and child_tail and child_inner[:1].isalpha())
-        if is_label and label_seen:
-            section_breaks.add(i)
+
+    i = 0
+    while i < len(children):
+        child = children[i]
+        if child.tag != _TAG_B:
+            i += 1
+            continue
+
+        first_text = ''.join(child.itertext()).strip()
+        if not first_text[:1].isalpha():
+            i += 1
+            continue
+
+        # Walk a chain of consecutive <b> elements linked by empty tails to
+        # find if they collectively end with ':' followed by non-empty text.
+        j = i
+        is_label = False
+        while j < len(children) and children[j].tag == _TAG_B:
+            j_text = ''.join(children[j].itertext()).strip()
+            j_tail = (children[j].tail or '').strip()
+            if j_text.endswith(':') and j_tail:
+                is_label = True
+                break
+            if j_tail:  # non-empty tail without colon — chain ends, not a label
+                break
+            j += 1
+
         if is_label:
+            if label_seen:
+                section_breaks.add(i)
             label_seen = True
+            i = j + 1
+        else:
+            i += 1
 
     result = ET.Element(_TAG_P)
     if geo_el.text and geo_el.text.strip():
