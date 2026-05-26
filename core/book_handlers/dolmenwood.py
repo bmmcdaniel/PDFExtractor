@@ -104,8 +104,8 @@ _DESC_MAX_SIZE     = 18
 # Fraction of page width used to decide "left edge", "right edge", "centre".
 # The hex number sits in the outer margin; the description is centred.
 _EDGE_FRACTION    = 0.35   # x < pw*0.35 → left edge; x > pw*0.65 → right edge
-_CENTRE_MIN_FRAC  = 0.15   # description x0 must be > pw*0.15
-_CENTRE_MAX_FRAC  = 0.85   # description x1 must be < pw*0.85
+_CENTRE_MIN_FRAC  = 0.13   # description x0 must be > pw*0.13
+_CENTRE_MAX_FRAC  = 0.87   # description x1 must be < pw*0.87
 
 # Vertical limit: only examine text in the top 60 pt of the page.
 _HEADER_MAX_Y = 60
