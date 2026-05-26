@@ -84,7 +84,7 @@ class BookHandler(ABC):
         """
 
     # ------------------------------------------------------------------
-    # Optional — subclasses MAY override this.
+    # Optional — subclasses MAY override these.
     # ------------------------------------------------------------------
 
     @property
@@ -95,3 +95,55 @@ class BookHandler(ABC):
         "Special handling for hex pages?" rather than the generic text.
         """
         return f"{self.name} detected.\nUse special per-page file naming?"
+
+    def transform_xhtml_page(self, xhtml_content: str) -> str:
+        """Optionally restructure a per-page XHTML file after extraction.
+
+        Called once per hex page (i.e. pages that appear in the filename_map)
+        when the user has chosen special handling.  The default implementation
+        is a no-op; override to reorder elements, fix duplicated text, etc.
+
+        *xhtml_content* is a complete, well-formed XHTML document string.
+        Return the transformed string (or *xhtml_content* unchanged if no
+        transformation applies to this particular page).
+        """
+        return xhtml_content
+
+    @property
+    def supports_fvtt(self) -> bool:
+        """Return True if this handler supports Foundry VTT journal export."""
+        return False
+
+    def build_default_profile(self, doc: pymupdf.Document):
+        """Return a default ExtractionProfile for *doc*, or None.
+
+        Override to provide a book-specific profile with correct section
+        boundaries and link rules.  Return None to fall back to the
+        UI-driven TOC-level selection.
+
+        Import ExtractionProfile inside the method body to avoid a circular
+        import at module load time.
+        """
+        return None
+
+    def stem_to_title(self, stem: str) -> str:
+        """Convert a filename stem to a human-readable journal page title.
+
+        Called for every page that has a filename_map entry when building
+        journal groups for FVTT output.  Override to produce a title that
+        fits the book's naming convention.
+
+        Default: replace underscores with spaces.
+        """
+        return stem.replace("_", " ")
+
+    def stem_to_semantic_keys(self, stem: str) -> dict[str, str]:
+        """Extract semantic link keys from a filename stem.
+
+        Returns a dict mapping key_type → key_value.  These entries are
+        collected into a semantic index used by resolve_links() to resolve
+        "@semantic_key" link rules in the profile.
+
+        Default: no semantic keys (empty dict).
+        """
+        return {}

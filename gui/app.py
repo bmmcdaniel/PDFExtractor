@@ -23,6 +23,48 @@ from gui.thumbnail_grid import ThumbnailGrid
 log = logging.getLogger(__name__)
 
 
+def _wire_fvtt_extras(
+    extra: dict,
+    doc,
+    pages: list[int],
+    output_path: str,
+    book_handler,       # BookHandler | None (None means no special handling)
+    toc_level: int,
+    pdf_filepath: str,
+) -> None:
+    """Populate *extra* with the profile and book-handler callables for FVTT extraction.
+
+    Called from the background extraction thread.  Loads a saved profile if one
+    exists alongside the PDF; otherwise generates and saves a new one from the
+    book handler (if any) or from the user-chosen TOC level.
+    """
+    from core.extraction_profile import (
+        ExtractionProfile, build_toc_profile, profile_path_for,
+    )
+
+    prof_path = profile_path_for(pdf_filepath)
+
+    if prof_path.exists():
+        profile = ExtractionProfile.load(prof_path)
+    elif book_handler is not None:
+        profile = book_handler.build_default_profile(doc)
+        if profile is None:
+            profile = build_toc_profile(doc, Path(output_path).stem, toc_level)
+        profile.save(prof_path)
+    else:
+        profile = build_toc_profile(doc, Path(output_path).stem, toc_level)
+        profile.save(prof_path)
+
+    extra["profile"] = profile
+
+    if book_handler is not None:
+        filename_map = book_handler.build_filename_map(doc, pages)
+        extra["filename_map"] = filename_map
+        extra["page_xhtml_transform"] = book_handler.transform_xhtml_page
+        extra["stem_to_title"] = book_handler.stem_to_title
+        extra["stem_to_semantic_keys"] = book_handler.stem_to_semantic_keys
+
+
 class App(customtkinter.CTk, TkinterDnD.DnDWrapper):
     """Main application window."""
 
@@ -31,10 +73,11 @@ class App(customtkinter.CTk, TkinterDnD.DnDWrapper):
         self.TkdndVersion = TkinterDnD._require(self)
 
         self.title("PDF Text & Image Extractor")
-        self.geometry("920x750")
-        self.minsize(800, 600)
+        self.geometry("920x820")
+        self.minsize(800, 660)
 
         self._pdf_handler: PDFHandler | None = None
+        self._book_handler = None
         self._working = False
         self._settings = load_settings()
         self._zoom_status_after_id: str | None = None
@@ -210,8 +253,10 @@ class App(customtkinter.CTk, TkinterDnD.DnDWrapper):
             self._pdf_handler.close()
             self._pdf_handler = None
 
+        self._book_handler = None
         self._thumb_grid.clear()
         self._text_panel.set_enabled(False)
+        self._text_panel.set_fvtt_available(False)
         self._image_panel.set_enabled(False)
 
         try:
@@ -284,6 +329,9 @@ class App(customtkinter.CTk, TkinterDnD.DnDWrapper):
     def _on_thumbnails_loaded(self, total) -> None:
         """Handle successful thumbnail generation."""
         self._thumb_grid.finish_loading()
+        self._book_handler = get_handler(self._pdf_handler.document)
+        fvtt_ok = self._book_handler is not None and self._book_handler.supports_fvtt
+        self._text_panel.set_fvtt_available(fvtt_ok)
         self._text_panel.set_enabled(True)
         self._image_panel.set_enabled(True)
         self._set_status(f"All {total} pages selected")
@@ -313,37 +361,49 @@ class App(customtkinter.CTk, TkinterDnD.DnDWrapper):
         fmt = self._text_panel.get_format()
         options = self._text_panel.get_options()
 
-        ext_map = {
-            "md": ("Markdown files", "*.md", ".md"),
-            "txt": ("Text files", "*.txt", ".txt"),
-            "xhtml": ("XHTML files", "*.xhtml", ".xhtml"),
-            "docx": ("Word documents", "*.docx", ".docx"),
-        }
-        desc, pattern, ext = ext_map[fmt]
+        if fmt == "fvtt":
+            # Ask for the Foundry Data folder (the one that maps to /user-data/).
+            # Output will always be placed in {data_folder}/assets/dcb/.
+            data_root_default = self._settings.get(
+                "foundry_data_root",
+                self._settings.get("last_save_dir",
+                                   str(Path(self._pdf_handler.filepath).parent)),
+            )
+            foundry_data_root = filedialog.askdirectory(
+                title="Select your Foundry Data folder (the folder that maps to /user-data/)",
+                initialdir=data_root_default,
+            )
+            if not foundry_data_root:
+                return
+            self._settings["foundry_data_root"] = foundry_data_root
+            output_parent = str(Path(foundry_data_root) / "assets")
+            save_settings(self._settings)
+        else:
+            ext_map = {
+                "md":   ("Markdown files",   "*.md",    ".md"),
+                "txt":  ("Text files",       "*.txt",   ".txt"),
+                "xhtml":("XHTML files",      "*.xhtml", ".xhtml"),
+                "docx": ("Word documents",   "*.docx",  ".docx"),
+            }
+            desc, pattern, ext = ext_map[fmt]
+            default_dir = self._settings.get(
+                "last_save_dir", str(Path(self._pdf_handler.filepath).parent)
+            )
+            output_path = filedialog.asksaveasfilename(
+                title="Save Extracted Text",
+                initialdir=default_dir,
+                initialfile=f"{self._pdf_handler.stem}{ext}",
+                filetypes=[(desc, pattern), ("All files", "*.*")],
+                defaultextension=ext,
+            )
+            if not output_path:
+                return
+            self._settings["last_save_dir"] = str(Path(output_path).parent)
+            save_settings(self._settings)
 
-        default_dir = self._settings.get(
-            "last_save_dir", str(Path(self._pdf_handler.filepath).parent)
-        )
-        default_name = f"{self._pdf_handler.stem}{ext}"
-
-        output_path = filedialog.asksaveasfilename(
-            title="Save Extracted Text",
-            initialdir=default_dir,
-            initialfile=default_name,
-            filetypes=[(desc, pattern), ("All files", "*.*")],
-            defaultextension=ext,
-        )
-        if not output_path:
-            return
-
-        self._settings["last_save_dir"] = str(Path(output_path).parent)
-        save_settings(self._settings)
-
-        book_handler = None
+        book_handler = self._book_handler if fmt not in ("docx",) else None
         use_hex = False
-        if fmt != "docx":
-            book_handler = get_handler(self._pdf_handler.document)
-        if book_handler:
+        if book_handler and fmt != "fvtt":
             use_hex = ask_hex_handling(self, book_handler.detection_message)
 
         self._set_status(f"Extracting text from {len(pages)} pages...")
@@ -351,33 +411,54 @@ class App(customtkinter.CTk, TkinterDnD.DnDWrapper):
         self._set_ui_locked(True)
 
         extractor = TextExtractor(self._pdf_handler)
-        extract_fn = {
-            "md": extractor.extract_markdown,
-            "txt": extractor.extract_plain_text,
-            "xhtml": extractor.extract_xhtml,
-            "docx": extractor.extract_docx,
-        }[fmt]
-
         per_page = options["per_page"]
-        if fmt == "md":
-            extra = {"per_page": per_page, "normalize_headers": options["normalize_headers"]}
-        elif fmt == "txt":
-            extra = {"per_page": per_page}
-        elif fmt == "xhtml":
-            extra = {"per_page": per_page, "normalize_headers": options["normalize_headers"],
-                     "include_images": options["include_images"]}
-        else:  # docx
-            extra = {"normalize_headers": options["normalize_headers"]}
-
         doc = self._pdf_handler.document
 
         def do_extract():
+            progress_cb = lambda c, t: self._safe_after(0, self._update_progress, c, t)
+
+            if fmt == "fvtt":
+                from core.dcb_foundry_export import export_dcb_foundry
+                export_dcb_foundry(
+                    handler=self._pdf_handler,
+                    dolmenwood_handler=book_handler,
+                    pages=pages,
+                    output_parent=output_parent,
+                    foundry_data_root=foundry_data_root,
+                    normalize_headers=options["normalize_headers"],
+                    progress_callback=progress_cb,
+                )
+                folder = str(Path(output_parent) / "dcb")
+                return (None, folder)
+
+            if fmt == "md":
+                extra = {"per_page": per_page,
+                         "normalize_headers": options["normalize_headers"]}
+            elif fmt == "txt":
+                extra = {"per_page": per_page}
+            elif fmt == "xhtml":
+                extra = {"per_page": per_page,
+                         "normalize_headers": options["normalize_headers"],
+                         "include_images": options["include_images"]}
+            else:  # docx
+                extra = {"normalize_headers": options["normalize_headers"]}
+
             if use_hex and per_page and book_handler:
                 extra["filename_map"] = book_handler.build_filename_map(doc, pages)
+                if fmt == "xhtml":
+                    extra["page_xhtml_transform"] = book_handler.transform_xhtml_page
+
+            extract_fn = {
+                "md":   extractor.extract_markdown,
+                "txt":  extractor.extract_plain_text,
+                "xhtml":extractor.extract_xhtml,
+                "docx": extractor.extract_docx,
+            }[fmt]
+
             extract_fn(
                 pages=pages,
                 output_path=output_path,
-                progress_callback=lambda c, t: self._safe_after(0, self._update_progress, c, t),
+                progress_callback=progress_cb,
                 **extra,
             )
             folder = str(Path(output_path).parent)

@@ -60,10 +60,13 @@ want to extract.
 from __future__ import annotations
 
 import re
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass, field
 
 import pymupdf
 
 from core.book_handlers.base import BookHandler
+from core.text_extractor import _title_case
 
 # ── Detection ─────────────────────────────────────────────────────────────────
 
@@ -142,6 +145,94 @@ class DolmenwoodHandler(BookHandler):
     @property
     def detection_message(self) -> str:
         return "Dolmenwood Campaign Book detected.\nSpecial handling for hex pages?"
+
+    def transform_xhtml_page(self, xhtml_content: str) -> str:
+        return restructure_hex_page(xhtml_content)
+
+    @property
+    def supports_fvtt(self) -> bool:
+        return True
+
+    def build_default_profile(self, doc: pymupdf.Document):
+        """Return an ExtractionProfile tuned for the Dolmenwood Campaign Book.
+
+        Three sections:
+          pre-hex  (pages before Part Six)  — TOC level 2 grouping
+          hex      (Part Six pages)         — one journal page per PDF page,
+                                              with XHTML restructuring applied
+          post-hex (pages after Part Six)   — TOC level 2 grouping
+
+        Link rules:
+          p. N     → Foundry link to the journal page that contains PDF page N
+          hex NNNN → Foundry link to the hex-description journal page
+        """
+        from core.extraction_profile import (
+            ExtractionProfile, SectionRule, LinkRule,
+        )
+
+        start, end = self._find_hex_range(doc)
+        sections = []
+
+        if start > 0:
+            sections.append(SectionRule(
+                name="Pre-Hex Content",
+                page_start=0,
+                page_end=start - 1,
+                strategy="toc",
+                toc_level=2,
+                transform=False,
+            ))
+
+        if start != -1:
+            hex_end = end - 1   # _find_hex_range returns exclusive end
+            sections.append(SectionRule(
+                name="Hex Descriptions",
+                page_start=start,
+                page_end=hex_end,
+                strategy="page",
+                transform=True,
+            ))
+            if hex_end + 1 < doc.page_count:
+                sections.append(SectionRule(
+                    name="Appendices",
+                    page_start=hex_end + 1,
+                    page_end=doc.page_count - 1,
+                    strategy="toc",
+                    toc_level=2,
+                    transform=False,
+                ))
+        else:
+            sections.append(SectionRule(
+                name="Content",
+                page_start=0,
+                page_end=doc.page_count - 1,
+                strategy="toc",
+                toc_level=2,
+                transform=False,
+            ))
+
+        return ExtractionProfile(
+            journal_name="Dolmenwood Campaign Book",
+            sections=sections,
+            link_rules=[
+                LinkRule(r"\bp\.?\s*(\d+)", "pdf_page", group=1),
+                LinkRule(r"(?i)hex\s+(\d{4})", "semantic_key",
+                         group=1, key_type="hex_number"),
+            ],
+        )
+
+    def stem_to_title(self, stem: str) -> str:
+        """Convert 'Hex_0508_The_Skeletal_Gardener' → 'The Skeletal Gardener (Hex 0508)'."""
+        m = re.match(r'^Hex_(\d{4})_(.*)', stem)
+        if m:
+            name = m.group(2).replace("_", " ")
+            return f"{name} (Hex {m.group(1)})"
+        return stem.replace("_", " ")
+
+    def stem_to_semantic_keys(self, stem: str) -> dict[str, str]:
+        """Extract hex number from 'Hex_0508_…' for semantic link resolution."""
+        m = re.match(r'^Hex_(\d{4})_', stem)
+        return {"hex_number": m.group(1)} if m else {}
 
     def detect(self, doc: pymupdf.Document) -> bool:
         """Return True if the first 10 pages contain both detection strings."""
@@ -274,8 +365,355 @@ def _make_stem(hex_num: str, description: str) -> str:
     For a different book, rename the prefix ("Hex_") and adjust the
     formatting to match whatever identifier pattern that book uses.
     """
-    titled = description.title()
+    titled = _title_case(description)
     safe = _UNSAFE_CHARS_RE.sub('', titled)
     underscored = re.sub(r'\s+', '_', safe)
     clean = re.sub(r'_+', '_', underscored).strip('_')
     return f"Hex_{hex_num}_{clean}"
+
+
+# ── XHTML hex page parsing ────────────────────────────────────────────────────
+
+_XHTML_NS = "http://www.w3.org/1999/xhtml"
+_NS = f"{{{_XHTML_NS}}}"
+
+_TAG_P   = f"{_NS}p"
+_TAG_H1  = f"{_NS}h1"
+_TAG_H2  = f"{_NS}h2"
+_TAG_H3  = f"{_NS}h3"
+_TAG_B   = f"{_NS}b"
+_TAG_BR  = f"{_NS}br"
+_TAG_IMG = f"{_NS}img"
+_TAG_DIV = f"{_NS}div"
+
+# Aspect ratio (width ÷ height) at or above which an image is the hex map.
+# The hex map is roughly square; full-page illustrations are portrait-oriented.
+_HEX_MAP_MIN_RATIO = 0.85
+
+# Strip DOCTYPE before ET parsing; ET does not support external DTD references.
+_DOCTYPE_RE = re.compile(r'<!DOCTYPE[^>]*>', re.DOTALL)
+
+# The geographic-info paragraph starts with one of these strings.
+_GEO_STARTS = ("Terrain:", "Terrain ")
+
+
+@dataclass
+class HexPageElements:
+    """Structural components of a single Dolmenwood hex page.
+
+    Fields that could not be identified are None (scalars) or [] (lists).
+    All Element fields are live references into the same parsed tree, so
+    modifying them and re-serialising doc_root reflects every change.
+
+    Fields:
+        doc_root        — the <html> root of the full parsed document
+        page_div        — the <div id="page0"> containing all page content
+        page_number     — folio page number string, e.g. "243"
+        hex_number      — 4-digit hex code string, e.g. "0508"
+        hex_name        — <h2> element containing the hex title
+        hex_description — first substantial <p> after hex_name;
+                          text may be doubled (see get_description_text)
+        geographic_info — <p> element starting with "Terrain:"
+        hex_map         — <p> containing the roughly-square hex-grid image
+        features        — interleaved <h3>/<p> elements for all hex features
+                          in document order
+        other_images    — <p> elements containing portrait-format illustrations
+        unclassified    — elements that matched no identification rule
+    """
+    doc_root: ET.Element
+    page_div: ET.Element
+    page_number: str | None
+    hex_number: str | None
+    hex_name: ET.Element | None
+    hex_description: ET.Element | None
+    geographic_info: ET.Element | None
+    hex_map: ET.Element | None
+    features: list[ET.Element]
+    other_images: list[ET.Element]
+    unclassified: list[ET.Element]
+
+
+def parse_hex_page(xhtml_content: str) -> HexPageElements:
+    """Identify the structural components of a Dolmenwood hex page XHTML file.
+
+    *xhtml_content* is the full text of a single-page XHTML file produced
+    by the extractor.  Returns a HexPageElements dataclass.
+
+    Detection rules applied to each direct child of <div id="page0">:
+
+      page_number    — <p> whose complete inner text is 1–4 digits
+      hex_number     — <h1> whose inner text contains a 4-digit number
+      hex_name       — first <h2> in the div
+      hex_description — first substantial <p> (>20 chars) after the <h2>
+                        that is not an image paragraph or the geographic line
+      geographic_info — <p> whose inner text begins with "Terrain:"
+      hex_map        — first <p><img> with width÷height ≥ _HEX_MAP_MIN_RATIO
+      features       — all <h3> elements and remaining <p> elements after <h2>
+      other_images   — <p><img> elements with portrait-format ratio
+      unclassified   — any element that matched none of the above
+    """
+    content = _DOCTYPE_RE.sub('', xhtml_content, count=1)
+    ET.register_namespace('', _XHTML_NS)
+    doc_root = ET.fromstring(content)
+
+    div = doc_root.find(f'.//{_TAG_DIV}[@id="page0"]')
+    if div is None:
+        raise ValueError("No <div id='page0'> found in XHTML content")
+
+    page_number: str | None = None
+    hex_number: str | None = None
+    hex_name_el: ET.Element | None = None
+    hex_desc_el: ET.Element | None = None
+    geo_el: ET.Element | None = None
+    hex_map_el: ET.Element | None = None
+    features: list[ET.Element] = []
+    other_images: list[ET.Element] = []
+    unclassified: list[ET.Element] = []
+
+    hex_name_found = False
+    hex_desc_found = False
+
+    for child in div:
+        tag = child.tag
+        text = ''.join(child.itertext()).strip()
+
+        if tag == _TAG_P:
+            # Page number: pure digits, ≤4 chars, before the hex name heading
+            if not hex_name_found and not page_number and re.fullmatch(r'\d{1,4}', text):
+                page_number = text
+                continue
+
+            # Image paragraph: classify by width-to-height aspect ratio
+            img = child.find(_TAG_IMG)
+            if img is not None:
+                try:
+                    ratio = int(img.get('width', 0)) / int(img.get('height', 1))
+                except (ValueError, ZeroDivisionError):
+                    ratio = 0.0
+                if ratio >= _HEX_MAP_MIN_RATIO and hex_map_el is None:
+                    hex_map_el = child
+                else:
+                    other_images.append(child)
+                continue
+
+            # Geographic info: inner text starts with "Terrain:"
+            if any(text.startswith(s) for s in _GEO_STARTS):
+                geo_el = child
+                continue
+
+            # Hex description: first substantial <p> after the hex name
+            if hex_name_found and not hex_desc_found and len(text) > 20:
+                hex_desc_el = child
+                hex_desc_found = True
+                continue
+
+            if hex_name_found:
+                features.append(child)
+            else:
+                unclassified.append(child)
+
+        elif tag == _TAG_H1:
+            m = re.search(r'\d{4}', text)
+            if m:
+                hex_number = m.group()
+            else:
+                unclassified.append(child)
+
+        elif tag == _TAG_H2:
+            if not hex_name_found:
+                hex_name_el = child
+                hex_name_found = True
+            else:
+                features.append(child)
+
+        elif tag == _TAG_H3:
+            if hex_name_found:
+                features.append(child)
+            else:
+                unclassified.append(child)
+
+        else:
+            unclassified.append(child)
+
+    return HexPageElements(
+        doc_root=doc_root,
+        page_div=div,
+        page_number=page_number,
+        hex_number=hex_number,
+        hex_name=hex_name_el,
+        hex_description=hex_desc_el,
+        geographic_info=geo_el,
+        hex_map=hex_map_el,
+        features=features,
+        other_images=other_images,
+        unclassified=unclassified,
+    )
+
+
+def get_description_text(el: ET.Element) -> str:
+    """Return the deduplicated text of a hex description element.
+
+    PyMuPDF sometimes emits the hex description paragraph twice in a single
+    <p> element (a known rendering artifact where the text appears once for
+    each rendering layer).  When the inner text is an exact repetition of
+    itself (separated by 0–2 characters), only the first copy is returned.
+    Text that is not duplicated is returned unchanged.
+    """
+    text = ''.join(el.itertext()).strip()
+    n = len(text)
+    for sep_len in range(3):   # allow 0, 1, or 2 separator chars between copies
+        half = (n - sep_len) // 2
+        if half > 10 and 2 * half + sep_len == n and text[:half] == text[half + sep_len:]:
+            return text[:half]
+    return text
+
+
+def _split_geo_sections(geo_el: ET.Element) -> ET.Element:
+    """Return a single <p> with geographic sections separated by <br/> line breaks.
+
+    Section labels (Terrain:, Lost/encounters:, Foraging:, etc.) are bold
+    elements whose complete text ends with ':'.  Non-label bold text (monster
+    names, item names) is left inside its section.  A <br/> is inserted
+    immediately before each new section label so sections share one paragraph
+    block with only a line-break between them (no paragraph spacing).
+
+    Multi-element labels such as "Within the Ring of Chell (<i>p20</i>):"
+    are handled naturally: only the final <b> ends with ':', so the preceding
+    elements accumulate into the same section until the ':' is seen.
+    """
+    children = list(geo_el)
+
+    # Identify child indices where a new section begins (a label after a prior label).
+    section_breaks: set[int] = set()
+    label_seen = False
+    for i, child in enumerate(children):
+        child_inner = ''.join(child.itertext()).strip()
+        child_tail = (child.tail or '').strip()
+        is_label = (child.tag == _TAG_B and child_inner.endswith(':')
+                    and child_tail and child_inner[:1].isalpha())
+        if is_label and label_seen:
+            section_breaks.add(i)
+        if is_label:
+            label_seen = True
+
+    result = ET.Element(_TAG_P)
+    if geo_el.text and geo_el.text.strip():
+        result.text = geo_el.text
+
+    for i, child in enumerate(children):
+        if i in section_breaks:
+            result.append(ET.Element(_TAG_BR))
+        result.append(child)
+
+    return result
+
+
+# Matches the start of a bold-numbered table row: <b>1 …, <b>12 …, <b>3. …
+# (digit(s) immediately followed by a space or period inside a <b> tag).
+_TABLE_ROW_B_RE = re.compile(r'<b[^>]*>\d{1,2}[\s.]')
+
+# Matches the redundant column-header paragraph PyMuPDF emits above each table,
+# e.g. <p><b>d6 Room</b></p> or <p><b>d8 Encounter</b></p>.
+_TABLE_HEADER_P_RE = re.compile(r'<p[^>]*><b[^>]*>d\d+\s+\w+</b></p>\s*')
+
+# Matches any <p> element (lazy, dotall).
+_ANY_P_RE = re.compile(r'<p[^>]*>(.*?)</p>', re.DOTALL)
+
+
+def _split_table_paragraphs(html: str) -> str:
+    """Split run-on table paragraphs into one <p> per row.
+
+    PyMuPDF collapses multi-row tables into a single <p> where each row
+    begins with a bold numbered entry such as <b>1 Study.</b>.  This
+    function detects that pattern (≥2 numbered bold entries in one <p>)
+    and splits it into individual paragraphs, one per row.
+
+    The redundant column-header paragraph (e.g. <p><b>d6 Room</b></p>)
+    that PyMuPDF emits immediately before the data paragraph is also removed.
+    """
+    # Remove the column-header paragraphs first.
+    html = _TABLE_HEADER_P_RE.sub('', html)
+
+    def _try_split(m: re.Match) -> str:
+        inner = m.group(1)
+        starts = [sm.start() for sm in _TABLE_ROW_B_RE.finditer(inner)]
+        if len(starts) < 2:
+            return m.group(0)   # not a table paragraph — leave unchanged
+        parts = []
+        for i, start in enumerate(starts):
+            end = starts[i + 1] if i + 1 < len(starts) else len(inner)
+            parts.append(inner[start:end].rstrip())
+        return '\n'.join(f'<p>{p}</p>' for p in parts if p)
+
+    return _ANY_P_RE.sub(_try_split, html)
+
+
+def restructure_hex_page(xhtml_content: str) -> str:
+    """Reorder a Dolmenwood hex page XHTML into canonical reading order.
+
+    Output order:
+      1. <h2> title: "<hex name> – Hex <hex number>  Page <page number>"
+      2. <p> hex description (with PyMuPDF's text-doubling artifact removed)
+      3. <p> hex map image
+      4. One <p> per labeled geographic section (Terrain:, Lost/encounters:, …)
+      5. All remaining elements (features, other images, unclassified) in their
+         original document order.
+
+    Pages that cannot be identified as hex pages (no hex_number detected) are
+    returned unchanged so non-hex pages in the same extraction pass are safe.
+    """
+    els = parse_hex_page(xhtml_content)
+    if els.hex_number is None:
+        return xhtml_content
+
+    div = els.page_div
+
+    # Build the set of elements that move to a fixed new position.
+    consumed: set[int] = set()
+    for child in div:
+        if child.tag == _TAG_H1:
+            consumed.add(id(child))
+        elif child.tag == _TAG_P and ''.join(child.itertext()).strip() == (els.page_number or ''):
+            consumed.add(id(child))
+    for el in (els.hex_name, els.hex_description, els.geographic_info, els.hex_map):
+        if el is not None:
+            consumed.add(id(el))
+
+    new_children: list[ET.Element] = []
+
+    # 1. Title
+    title = ET.Element(_TAG_H2)
+    b = ET.SubElement(title, _TAG_B)
+    name_text = _title_case(''.join(els.hex_name.itertext()).strip()) if els.hex_name is not None else ''
+    b.text = f"{name_text} – Hex {els.hex_number} Page {els.page_number or '?'}"
+    new_children.append(title)
+
+    # 2. Hex description (deduplicated)
+    if els.hex_description is not None:
+        if len(els.hex_description) == 0:   # plain-text <p>: safe to overwrite .text
+            els.hex_description.text = get_description_text(els.hex_description)
+        new_children.append(els.hex_description)
+
+    # 3. Hex map
+    if els.hex_map is not None:
+        new_children.append(els.hex_map)
+
+    # 4. Geographic info: one <p> with <br/> between sections
+    if els.geographic_info is not None:
+        new_children.append(_split_geo_sections(els.geographic_info))
+
+    # 5. Everything else in original document order
+    for child in div:
+        if id(child) not in consumed:
+            new_children.append(child)
+
+    # Replace the div's children in place (doc_root tree is updated automatically)
+    for child in list(div):
+        div.remove(child)
+    for child in new_children:
+        div.append(child)
+
+    # Re-serialise, restoring the XML/DOCTYPE prolog that ET stripped
+    html_idx = xhtml_content.find('<html')
+    prolog = xhtml_content[:html_idx] if html_idx != -1 else ''
+    return prolog + ET.tostring(els.doc_root, encoding='unicode')
