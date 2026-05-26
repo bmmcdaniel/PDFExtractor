@@ -385,6 +385,7 @@ _TAG_B   = f"{_NS}b"
 _TAG_BR  = f"{_NS}br"
 _TAG_IMG = f"{_NS}img"
 _TAG_DIV = f"{_NS}div"
+_TAG_HR  = f"{_NS}hr"
 
 # Aspect ratio (width ÷ height) at or above which an image is the hex map.
 # The hex map is roughly square; full-page illustrations are portrait-oriented.
@@ -729,6 +730,19 @@ def restructure_hex_page(xhtml_content: str) -> str:
     # 4. Geographic info: one <p> with <br/> between sections
     if els.geographic_info is not None:
         new_children.append(_split_geo_sections(els.geographic_info))
+
+    # 4b. Party Activity block
+    hr1 = ET.Element(_TAG_HR)
+    new_children.append(hr1)
+    activity_h3 = ET.Element(_TAG_H3)
+    activity_b = ET.SubElement(activity_h3, _TAG_B)
+    activity_b.text = "Party Activity"
+    activity_h3.set("style", "color: rgb(180, 0, 0);")
+    new_children.append(activity_h3)
+    new_children.append(ET.Element(_TAG_P))
+    new_children.append(ET.Element(_TAG_P))
+    hr2 = ET.Element(_TAG_HR)
+    new_children.append(hr2)
 
     # 5. Everything else in original document order
     for child in div:
